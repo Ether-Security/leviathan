@@ -1,0 +1,226 @@
+package core
+
+import (
+	"os"
+	"path"
+	"sync"
+
+	"github.com/Ether-Security/leviathan/core/dsl"
+	"github.com/Ether-Security/leviathan/libs"
+	"github.com/Ether-Security/leviathan/utils"
+	"github.com/panjf2000/ants"
+	"gopkg.in/yaml.v3"
+)
+
+type Runner struct {
+	Target    string
+	Workspace string
+	Workflow  libs.Workflow
+	Options   *libs.Options
+	Reports   []string
+	DSL       map[string]interface{}
+
+	Params map[string]string
+}
+
+func InitRunner(target string, options *libs.Options) (*Runner, error) {
+	var runner Runner
+	runner.Target = target
+	runner.Options = options
+
+	// Create workspace if it does not exists
+	runner.Workspace = path.Join(options.Environment.Workspaces, utils.CleanPath(target))
+	if _, err := os.Stat(runner.Workspace); os.IsNotExist(err) {
+		utils.Logger.Debug().Str("workspace", runner.Workspace).Msg("Create workspace folder")
+		if err = os.MkdirAll(runner.Workspace, 0700); err != nil {
+			return &runner, err
+		}
+	}
+
+	// Init dsl with variables
+	runner.initDSL()
+	runner.initParams()
+
+	// Create .tmp directory in workspace
+	tmpDir := runner.Params["TempDir"]
+	if _, err := os.Stat(tmpDir); os.IsNotExist(err) {
+		utils.Logger.Debug().Str("workspace", runner.Workspace).Msg("Create TMP folder")
+		if err = os.MkdirAll(tmpDir, 0700); err != nil {
+			return &runner, err
+		}
+	}
+
+	// Create reports directory in workspace
+	reportsDir := runner.Params["ReportsDir"]
+	if _, err := os.Stat(reportsDir); os.IsNotExist(err) {
+		utils.Logger.Debug().Str("workspace", runner.Workspace).Msg("Create reports folder")
+		if err = os.MkdirAll(reportsDir, 0700); err != nil {
+			return &runner, err
+		}
+	}
+
+	// Add reports directory to whitelist
+	runner.Reports = append(runner.Reports, runner.Params["ReportsDir"])
+
+	// Try to import workflow
+	if !runner.importWorkflow() {
+		utils.Logger.Fatal().Str("workflow", runner.Options.Scan.Flow).Msg("Unable to import workflow")
+		return &runner, nil
+	}
+
+	// Check modules
+	for _, routine := range runner.Workflow.Routines {
+		for _, module := range routine.Modules {
+			if !utils.IsYamlValid(module, runner.Options.Environment.Modules) {
+				utils.Logger.Fatal().Str("module", module).Msg("Module invalid")
+				return &runner, nil
+			}
+		}
+	}
+
+	return &runner, nil
+}
+
+func (r *Runner) Start() {
+	utils.Logger.Info().
+		Str("runner", r.Target).
+		Str("workflow", r.Workflow.Name).
+		Msg("Start runner")
+
+	for _, routine := range r.Workflow.Routines {
+		// Check for params in module
+		createdParams := make(map[string]string)
+		for _, param := range routine.Params {
+			for k, v := range param {
+				// Routine params do not override workflow and user params
+				if r.Params[k] == "" {
+					utils.Logger.Info().Str("param", k).Str("value", v).Msg("Set routine param")
+					r.setParam(k, v)
+					createdParams[k] = v
+				}
+			}
+		}
+
+		// Start each modules
+		var wg sync.WaitGroup
+		p, _ := ants.NewPoolWithFunc(r.Options.Scan.Threads*10, func(m interface{}) {
+			module := m.(string)
+			r.startModule(module)
+			wg.Done()
+		}, ants.WithPreAlloc(true))
+		defer p.Release()
+
+		for _, module := range routine.Modules {
+			if err := p.Invoke(module); err != nil {
+				utils.Logger.Error().Msg(err.Error())
+			}
+			wg.Add(1)
+		}
+
+		wg.Wait()
+
+		// Delete routine params
+		for param, value := range createdParams {
+			utils.Logger.Debug().Str("param", param).Str("value", value).Msg("Delete routine param")
+			r.deleteParam(param)
+		}
+	}
+
+	if !r.Options.Scan.NoClean {
+		utils.Logger.Info().Str("workspace", r.Workspace).Msg("Clean workspace")
+		dsl.CleanWorkspace(r.Workspace, r.Reports)
+	}
+}
+
+func (r *Runner) importWorkflow() bool {
+	fullPath := utils.CheckExistence(r.Options.Scan.Flow, r.Options.Environment.Workflows)
+	content, err := r.ParseTemplate(fullPath)
+	if err != nil {
+		utils.Logger.Error().Msg(err.Error())
+		return false
+	}
+
+	if err = yaml.Unmarshal(content, &r.Workflow); err != nil {
+		utils.Logger.Error().Str("workflow", fullPath).Msg(err.Error())
+		return false
+	}
+
+	// Check validator
+	if !r.ValidateInputType() {
+		return false
+	}
+
+	// re-init params to handle Workflow params
+	r.initParams()
+	return true
+}
+
+func (r *Runner) startModule(moduleName string) {
+	utils.Logger.Info().Str("module", moduleName).Msg("Start module")
+
+	// Import module before executing it
+	m := libs.Module{}
+	fullPath := utils.CheckExistence(moduleName, r.Options.Environment.Modules)
+	content, _ := os.ReadFile(fullPath)
+	if err := yaml.Unmarshal(content, &m); err != nil {
+		utils.Logger.Error().Msg(err.Error())
+		return
+	}
+
+	// Check for params in module
+	// @TODO: Change how to handle module params to avoid race conditions
+	createdParams := make(map[string]string)
+	for _, param := range m.Params {
+		for k, v := range param {
+			// Module params do not override workflow, routine and user params
+			if r.Params[k] == "" {
+				utils.Logger.Info().Str("param", k).Str("value", v).Msg("Set module param")
+				r.setParam(k, v)
+				createdParams[k] = v
+			}
+		}
+	}
+
+	// Save the reports generated by the module
+	for _, report := range m.Reports {
+		reportPath := r.ParseString(report)
+		utils.Logger.Debug().Str("module", m.Name).Str("report", reportPath).Msg("Add report to the list")
+		r.Reports = append(r.Reports, utils.NormalizePath(reportPath))
+	}
+
+	// Check if module has to be skipped
+	if r.Options.Scan.Resume && len(m.Reports) != 0 {
+		skipModule := true
+		for _, report := range m.Reports {
+			if !utils.FileExists(r.ParseString(report)) {
+				skipModule = false
+			}
+		}
+		if skipModule {
+			utils.Logger.Info().Str("module", m.Name).Msg("skip module (--resume flag used)")
+			return
+		}
+	}
+
+	// Execute pre_run scripts
+	if m.PreRun != nil {
+		utils.Logger.Debug().Str("module", m.Name).Msg("Execute Pre_run scripts")
+		r.runScripts(m.PreRun)
+	}
+
+	utils.Logger.Debug().Str("module", m.Name).Msg("Execute step")
+	for _, step := range m.Steps {
+		r.RunStep(&step)
+	}
+
+	if m.PostRun != nil {
+		utils.Logger.Debug().Str("module", m.Name).Msg("Execute post_run scripts")
+		r.runScripts(m.PostRun)
+	}
+
+	// Delete module params
+	for param, value := range createdParams {
+		utils.Logger.Debug().Str("param", param).Str("value", value).Msg("Delete module param")
+		r.deleteParam(param)
+	}
+}

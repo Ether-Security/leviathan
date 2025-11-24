@@ -19,10 +19,6 @@ jobs:
         uses: actions/setup-go@v5
 
       - name: "Create release on GitHub"
-        uses: goreleaser/goreleaser-action@v6
-        with: 
-          args: "release --rm-dist"
-          version: latest
-          workdir: .
+        uses: goreleaser/goreleaser-action@v6        
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
